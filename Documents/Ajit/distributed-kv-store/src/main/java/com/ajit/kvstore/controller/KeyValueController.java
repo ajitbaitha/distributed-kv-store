@@ -3,11 +3,11 @@ package com.ajit.kvstore.controller;
 import com.ajit.kvstore.cluster.ClusterService;
 import com.ajit.kvstore.config.NodeConfig;
 import com.ajit.kvstore.model.ValueResponse;
+import com.ajit.kvstore.replication.ReplicationService;
 import com.ajit.kvstore.service.KeyValueStoreService;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.reactive.function.client.WebClient;
-
 
 import java.util.Map;
 
@@ -16,41 +16,56 @@ import java.util.Map;
 public class KeyValueController {
 
     private final KeyValueStoreService service;
-    private final NodeConfig nodeConfig;
     private final ClusterService clusterService;
+    private final ReplicationService replicationService;
+    private final NodeConfig nodeConfig;
     private final WebClient webClient;
 
     public KeyValueController(KeyValueStoreService service,
-                              NodeConfig nodeConfig,
                               ClusterService clusterService,
+                              ReplicationService replicationService,
+                              NodeConfig nodeConfig,
                               WebClient webClient) {
+
         this.service = service;
-        this.nodeConfig = nodeConfig;
         this.clusterService = clusterService;
+        this.replicationService = replicationService;
+        this.nodeConfig = nodeConfig;
         this.webClient = webClient;
     }
 
-
     @PutMapping("/{key}")
-    public ResponseEntity<Void> put(@PathVariable String key,
-                                    @RequestBody Map<String, String> body) {
+    public ResponseEntity<Void> put(
+            @PathVariable String key,
+            @RequestBody Map<String, String> body,
+            @RequestHeader(value = "X-REPLICA-WRITE", required = false) String replicaHeader) {
 
         String value = body.get("value");
-        String ownerNode = clusterService.getOwnerNode(key);
-        String currentNode = clusterService.getCurrentNodeUrl();
 
-        if (ownerNode.equals(currentNode)) {
+        // Replica writes are terminal
+        if ("true".equals(replicaHeader)) {
             service.put(key, value);
             return ResponseEntity.ok().build();
         }
 
-        // Forward PUT to owner node
-        webClient.put()
-                .uri(ownerNode + "/kv/" + key)
-                .bodyValue(body)
-                .retrieve()
-                .toBodilessEntity()
-                .block();
+        String ownerNodeId = clusterService.getOwnerNodeId(key);
+        String currentNodeId = nodeConfig.getNodeId();
+
+        if (!ownerNodeId.equals(currentNodeId)) {
+            String ownerNodeUrl = clusterService.getOwnerNodeUrl(key);
+
+            webClient.put()
+                    .uri(ownerNodeUrl + "/kv/" + key)
+                    .bodyValue(body)
+                    .retrieve()
+                    .toBodilessEntity()
+                    .block();
+
+            return ResponseEntity.ok().build();
+        }
+
+        service.put(key, value);
+        replicationService.replicate(key, value);
 
         return ResponseEntity.ok().build();
     }
@@ -58,36 +73,24 @@ public class KeyValueController {
     @GetMapping("/{key}")
     public ResponseEntity<ValueResponse> get(@PathVariable String key) {
 
-        String ownerNode = clusterService.getOwnerNode(key);
-        String currentNode = "http://localhost:" + nodeConfig.getPort();
+        String ownerNodeId = clusterService.getOwnerNodeId(key);
+        String currentNodeId = nodeConfig.getNodeId();
 
-        // If this node is the owner
-        if (ownerNode.equals(currentNode)) {
+        if (ownerNodeId.equals(currentNodeId)) {
             if (!service.containsKey(key)) {
                 return ResponseEntity.notFound().build();
             }
-            return ResponseEntity.ok(
-                    new ValueResponse(service.get(key))
-            );
+            return ResponseEntity.ok(new ValueResponse(service.get(key)));
         }
 
-        // Forward GET request to owner node
+        String ownerNodeUrl = clusterService.getOwnerNodeUrl(key);
+
         ValueResponse response = webClient.get()
-                .uri(ownerNode + "/kv/" + key)
+                .uri(ownerNodeUrl + "/kv/" + key)
                 .retrieve()
                 .bodyToMono(ValueResponse.class)
                 .block();
 
         return ResponseEntity.ok(response);
     }
-
-
-    @GetMapping("/node/info")
-    public Map<String, Object> nodeInfo() {
-        return Map.of(
-                "nodeId", nodeConfig.getNodeId(),
-                "clusterNodes", nodeConfig.getClusterNodes()
-        );
-    }
-
 }
